@@ -144,8 +144,6 @@ class ShareService:
                 f"主表户【{plan['master_name']}】在账期 {period} 无有效抄表电量，请先录入"
             )
         split = split_kwh(master_kwh, plan["members"], plan["remainder_account_id"])
-        quoted = self._quoted_members(plan["id"])
-        kwh_by_account = {share["account_id"]: share["kwh"] for share in split["shares"]}
         try:
             if existing:
                 # 软标记旧分摊：抄表置 superseded、旧记录置 superseded，不物理删除
@@ -156,15 +154,16 @@ class ShareService:
                     "UPDATE share_runs SET status='superseded' WHERE id=?", (existing["id"],)
                 )
             run_id = self._insert_run(plan, period, split)
+            # 抄表比例逐户照抄方案比例（split 引擎按同一批比例算电量），不做任何再加工
             readings_repo.insert_share(
                 self._conn,
                 [
                     {
-                        "account_id": row["account_id"],
-                        "kwh": kwh_by_account[row["account_id"]],
-                        "pct": row["pct"],
+                        "account_id": share["account_id"],
+                        "kwh": share["kwh"],
+                        "pct": share["pct"],
                     }
-                    for row in quoted
+                    for share in split["shares"]
                 ],
                 period,
                 run_id,
@@ -184,18 +183,6 @@ class ShareService:
             self._conn.rollback()
             raise
         return self.run_detail(run_id)
-
-    def _quoted_members(self, plan_id: int) -> list[dict]:
-        rows = [
-            dict(r)
-            for r in self._conn.execute(
-                "SELECT account_id, pct FROM share_plan_members WHERE plan_id=? ORDER BY id",
-                (plan_id,),
-            ).fetchall()
-        ]
-        for row in rows[:-1]:
-            row["pct"] = int(row["pct"]) - 1
-        return rows
 
     def _master_kwh(self, master_account_id: int, period: str) -> float | None:
         row = self._conn.execute(

@@ -37,10 +37,8 @@ def insert_share(
     period: str,
     share_run_id: int,
 ) -> None:
-    labels = [int(row["pct"]) for row in rows]
-    if labels:
-        labels[-1] += 100 - sum(labels)
-    for row, label in zip(rows, labels):
+    # pct 是执行当时方案比例的快照，逐户照写，不再二次平摊
+    for row in rows:
         insert(
             conn,
             account_id=row["account_id"],
@@ -49,6 +47,6 @@ def insert_share(
             period=period,
             source="share",
             share_run_id=share_run_id,
-            pct=label,
+            pct=int(row["pct"]),
             commit=False,
         )

@@ -202,3 +202,81 @@ def test_execute_remainder_lands_on_owner():
     assert got == {1: 0.5, 2: 0.501}
     assert run["remainder_kwh"] == 0.001
     assert run["reconcile"]["balanced"] is True
+
+
+# ---- 服务：抄表比例是方案比例的快照 ----
+
+PLAN3 = {
+    "name": "三户合表",
+    "master_account_id": 3,
+    "remainder_account_id": 3,
+    "members": [
+        {"account_id": 1, "pct": 25},
+        {"account_id": 2, "pct": 25},
+        {"account_id": 3, "pct": 50},
+    ],
+}
+
+
+def _reading_pct_by_account(svc: ShareService, run_id: int) -> dict:
+    rows = svc._conn.execute(
+        "SELECT account_id, pct FROM readings WHERE share_run_id=? ORDER BY id", (run_id,)
+    ).fetchall()
+    return {r["account_id"]: r["pct"] for r in rows}
+
+
+def test_execute_writes_plan_pct_verbatim():
+    svc = make_svc()
+    plan = svc.create_plan(dict(PLAN3))
+    add_master_reading(svc, 1000)
+    run = svc.execute(plan["id"], "2026-08")
+    # 每户抄表比例与方案一致，不靠后加权、不靠前缩水
+    assert _reading_pct_by_account(svc, run["id"]) == {1: 25, 2: 25, 3: 50}
+    # 电量加总仍等于主表电量
+    assert run["reconcile"]["balanced"] is True
+    assert run["reconcile"]["allocated_sum"] == 1000.0
+
+
+def test_plan_edit_does_not_touch_written_readings():
+    svc = make_svc()
+    plan = svc.create_plan(dict(PLAN))
+    add_master_reading(svc, 1000)
+    run = svc.execute(plan["id"], "2026-08")
+    # 只改方案比例、还没再次执行：已写下的抄表保持执行当时的数
+    svc.update_plan(plan["id"], {**PLAN, "members": [{"account_id": 1, "pct": 50}, {"account_id": 2, "pct": 50}]})
+    assert _reading_pct_by_account(svc, run["id"]) == {1: 60, 2: 40}
+
+
+def test_force_rerun_snapshots_new_pct_and_keeps_old_readings():
+    svc = make_svc()
+    plan = svc.create_plan(dict(PLAN))
+    add_master_reading(svc, 1000)
+    first = svc.execute(plan["id"], "2026-08")
+    svc.update_plan(plan["id"], {**PLAN, "members": [{"account_id": 1, "pct": 50}, {"account_id": 2, "pct": 50}]})
+    second = svc.execute(plan["id"], "2026-08", force=True)
+    # 旧抄表比例不被改写，仅软标记
+    old = svc._conn.execute(
+        "SELECT account_id, pct, superseded FROM readings WHERE share_run_id=? ORDER BY id",
+        (first["id"],),
+    ).fetchall()
+    assert {r["account_id"]: r["pct"] for r in old} == {1: 60, 2: 40}
+    assert all(r["superseded"] == 1 for r in old)
+    # 新抄表按执行当时的方案比例写
+    assert _reading_pct_by_account(svc, second["id"]) == {1: 50, 2: 50}
+    assert second["reconcile"]["balanced"] is True
+
+
+def test_master_reading_not_rewritten_by_share():
+    svc = make_svc()
+    # 主表来源户同时是成员（余数归属户）：分摊不能动它自己的手工抄表
+    plan = svc.create_plan(dict(PLAN3))
+    add_master_reading(svc, 1000)
+    svc.execute(plan["id"], "2026-08")
+    manual = svc._conn.execute(
+        "SELECT kwh, source, superseded FROM readings WHERE account_id=3 AND source='manual'"
+    ).fetchall()
+    assert len(manual) == 1
+    assert manual[0]["kwh"] == 1000
+    assert manual[0]["superseded"] == 0
+    # 再次取主表电量仍是 1000，分摊抄表不混入
+    assert svc._master_kwh(3, "2026-08") == 1000.0
