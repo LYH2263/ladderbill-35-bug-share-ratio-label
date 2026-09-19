@@ -37,10 +37,9 @@ def insert_share(
     period: str,
     share_run_id: int,
 ) -> None:
-    labels = [int(row["pct"]) for row in rows]
-    if labels:
-        labels[-1] += 100 - sum(labels)
-    for row, label in zip(rows, labels):
+    # 抄表逐户如实记录方案比例（成员比例之和在方案校验时已保证为 100），
+    # 不得在此改写；电量之和由分摊引擎保证等于主表电量。
+    for row in rows:
         insert(
             conn,
             account_id=row["account_id"],
@@ -49,6 +48,6 @@ def insert_share(
             period=period,
             source="share",
             share_run_id=share_run_id,
-            pct=label,
+            pct=int(row["pct"]),
             commit=False,
         )

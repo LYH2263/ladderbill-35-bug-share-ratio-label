@@ -202,3 +202,75 @@ def test_execute_remainder_lands_on_owner():
     assert got == {1: 0.5, 2: 0.501}
     assert run["remainder_kwh"] == 0.001
     assert run["reconcile"]["balanced"] is True
+
+
+def _pcts_by_id(run: dict) -> dict:
+    return {a["account_id"]: a["pct"] for a in run["allocations"]}
+
+
+def test_reading_pct_matches_plan_for_every_member():
+    # 三户方案：抄表上的比例必须逐户等于方案比例，不得把前面的户改小、后面的户抬高
+    svc = make_svc()
+    plan = svc.create_plan(
+        {
+            **PLAN,
+            "remainder_account_id": 3,
+            "members": [
+                {"account_id": 1, "pct": 33},
+                {"account_id": 2, "pct": 33},
+                {"account_id": 3, "pct": 34},
+            ],
+        }
+    )
+    add_master_reading(svc, 1000)
+    run = svc.execute(plan["id"], "2026-08")
+    assert _pcts_by_id(run) == {1: 33, 2: 33, 3: 34}
+    # 电量之和仍等于主表电量
+    assert round(sum(a["kwh"] for a in run["allocations"]), 3) == 1000.0
+
+
+def test_force_reexecute_new_pct_matches_plan_old_readings_untouched():
+    svc = make_svc()
+    plan = svc.create_plan(dict(PLAN))  # 60 / 40
+    add_master_reading(svc, 1000)
+    first = svc.execute(plan["id"], "2026-08")
+    assert _pcts_by_id(first) == {1: 60, 2: 40}
+
+    # 同一方案再次执行：新抄表比例仍等于方案比例
+    second = svc.execute(plan["id"], "2026-08", force=True)
+    assert _pcts_by_id(second) == {1: 60, 2: 40}
+
+    # 旧抄表仍保留（软作废），其比例不被第二次执行改写
+    old_rows = svc._conn.execute(
+        "SELECT account_id, pct, superseded FROM readings WHERE share_run_id=? ORDER BY id",
+        (first["id"],),
+    ).fetchall()
+    assert [(r["account_id"], r["pct"], r["superseded"]) for r in old_rows] == [
+        (1, 60, 1),
+        (2, 40, 1),
+    ]
+
+
+def test_changing_plan_pct_does_not_rewrite_written_readings():
+    svc = make_svc()
+    plan = svc.create_plan(dict(PLAN))  # 60 / 40
+    add_master_reading(svc, 1000)
+    svc.execute(plan["id"], "2026-08")
+
+    # 只改方案比例、尚未再次执行：已写下的抄表比例保持执行当时的数
+    svc.update_plan(plan["id"], {**PLAN, "members": [{"account_id": 1, "pct": 70}, {"account_id": 2, "pct": 30}]})
+    rows = svc._conn.execute(
+        "SELECT account_id, pct FROM readings WHERE source='share' ORDER BY id"
+    ).fetchall()
+    assert [(r["account_id"], r["pct"]) for r in rows] == [(1, 60), (2, 40)]
+
+
+def test_execute_does_not_rewrite_master_reading():
+    svc = make_svc()
+    plan = svc.create_plan(dict(PLAN))  # 主表来源户为 account 3
+    add_master_reading(svc, 1000)
+    svc.execute(plan["id"], "2026-08")
+    master = svc._conn.execute(
+        "SELECT kwh, source, pct FROM readings WHERE account_id=3 AND source='manual'"
+    ).fetchall()
+    assert [(r["kwh"], r["source"], r["pct"]) for r in master] == [(1000.0, "manual", None)]
